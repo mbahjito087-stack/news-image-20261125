@@ -1,147 +1,133 @@
 #!/usr/bin/env python3
-"""Copy the finished front page for Wednesday 25 November 2026 to the output.
+"""Publish the front page for Wednesday 25 November 2026.
 
-The picture already exists beside this file as asset.jpg: a newspaper
-front page for 25 November 2026. Its lead is Zelenskiy confirming
-Ukraine's drone strike on a Russian ship in the Gulf of Finland, with
-Norway urging caution, and the rest of the page carries five more
-stories from the same day: a Houthi drone hitting Riyadh's tallest
-tower and wounding 11, Trump awarding Rudy Giuliani the Medal of
-Freedom, Huawei convicted in a sprawling US criminal trial, NATO
-sending early-warning jets to Poland, and the Thanksgiving turkeys
-Freedom and Feathers being spared.
+The finished page ships next to this file as ``asset.jpg``. It is a
+broadsheet front page for 25 November 2026 whose lead is Zelenskiy's
+confirmation that Ukraine struck a Russian ship in the Gulf of
+Finland. Five further stories share the page: a Houthi drone hitting
+Riyadh's tallest tower and wounding eleven people, Donald Trump
+presenting Rudy Giuliani with the Medal of Freedom, Huawei's
+conviction in an American criminal trial, NATO moving early-warning
+aircraft to Poland, and the two Thanksgiving turkeys, Freedom and
+Feathers, being spared.
 
-This program draws nothing and changes nothing. It checks that the
-image is a complete JPEG within the contest limits, copies it
-byte-for-byte to the output directory as entry.png (the rules accept
-JPEG bytes under that name, told apart by the file's first bytes),
-and then proves the copy is exact by comparing file size and
-SHA-256 digest. No network, no clock, no randomness: the same input
-always produces the same output.
+The script itself draws nothing. It proves the picture is a whole
+JPEG inside the contest limits, copies its bytes to the output
+directory under the name ``entry.png`` (the contest reads the format
+from the first bytes, so JPEG bytes under that name are fine), and
+then checks the copy by size, digest and dimensions. Nothing here
+touches the network, the clock or any random source, so two runs
+always write the same bytes.
 """
+
+from __future__ import annotations
 
 import hashlib
 import os
-import shutil
+import struct
 import sys
+from pathlib import Path
 
-ASSET = "asset.jpg"
-OUTPUT_NAME = "entry.png"
-FALLBACK_OUTPUT_DIR = "/output"
-BYTE_LIMIT = 1048576
-PIXEL_LIMIT = 1024
-SOI = b"\xff\xd8\xff"
-EOI = b"\xff\xd9"
+ASSET_NAME = "asset.jpg"
+OUT_NAME = "entry.png"
+MAX_BYTES = 1_048_576
+MAX_SIDE = 1_024
 
 
-def digest_file(path):
-    """SHA-256 hex digest of a file, read in 1 MiB chunks."""
-    hasher = hashlib.sha256()
-    with open(path, "rb") as stream:
-        while True:
-            block = stream.read(1024 * 1024)
-            if not block:
-                break
-            hasher.update(block)
-    return hasher.hexdigest()
+class EntryError(Exception):
+    """A problem with the picture or the output that must stop the run."""
 
 
-def is_complete_jpeg(path):
-    """True when a file opens with the JPEG start marker and ends with EOI."""
-    with open(path, "rb") as stream:
-        opening = stream.read(3)
-        stream.seek(-2, os.SEEK_END)
-        closing = stream.read(2)
-    return opening == SOI and closing == EOI
+def digest(blob: bytes) -> str:
+    """Hex SHA-256 of a byte string."""
+    return hashlib.sha256(blob).hexdigest()
 
 
-def read_jpeg_size(path):
-    """Return (width, height) from the first JPEG frame marker, else None.
+def jpeg_dimensions(blob: bytes) -> tuple[int, int]:
+    """Pull (width, height) out of a JPEG's first frame segment.
 
-    Scans the marker segments with the standard library only. A segment
-    begins with 0xFF, a marker byte and a 2-byte big-endian length; the
-    frame markers 0xC0-0xC3 store height then width as 2-byte values.
+    Walks the marker segments with struct instead of manual index
+    arithmetic: each segment is 0xFF, a marker byte and a big-endian
+    length, and the frame markers 0xC0-0xC3 carry height then width.
+    Raises EntryError when no frame segment turns up.
     """
-    with open(path, "rb") as stream:
-        blob = stream.read()
     if blob[:2] != b"\xff\xd8":
-        return None
-    offset = 2
-    while offset + 4 <= len(blob):
-        if blob[offset] != 0xFF:
-            return None
-        marker = blob[offset + 1]
-        if marker == 0xD8 or marker == 0xD9 or 0xD0 <= marker <= 0xD7:
-            offset += 2
+        raise EntryError("asset does not start with a JPEG SOI marker")
+    pos = 2
+    while pos + 4 <= len(blob):
+        if blob[pos] != 0xFF:
+            raise EntryError("asset has a broken JPEG marker chain")
+        marker = blob[pos + 1]
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            pos += 2
             continue
-        length = int.from_bytes(blob[offset + 2:offset + 4], "big")
+        (length,) = struct.unpack_from(">H", blob, pos + 2)
         if 0xC0 <= marker <= 0xC3:
-            height = int.from_bytes(blob[offset + 5:offset + 7], "big")
-            width = int.from_bytes(blob[offset + 7:offset + 9], "big")
+            height, width = struct.unpack_from(">HH", blob, pos + 5)
             return width, height
-        offset += 2 + length
-    return None
+        pos += 2 + length
+    raise EntryError("asset has no JPEG frame segment")
 
 
-def abort(message):
-    """Report a failure on stderr and return the failing exit code."""
-    print("error: " + message, file=sys.stderr)
-    return 1
-
-
-def run():
-    base = os.path.dirname(os.path.abspath(__file__))
-    asset = os.path.join(base, ASSET)
-
-    if not os.path.isfile(asset):
-        return abort("missing " + ASSET + " next to main.py: " + asset)
-
-    size = os.path.getsize(asset)
-    if size == 0:
-        return abort(ASSET + " is empty: " + asset)
-    if size > BYTE_LIMIT:
-        return abort(
-            "%s is %d bytes, over the %d-byte limit" % (ASSET, size, BYTE_LIMIT)
+def check_picture(blob: bytes) -> tuple[int, int]:
+    """Confirm the picture obeys the contest limits; return its size."""
+    if not blob:
+        raise EntryError("asset is empty")
+    if len(blob) > MAX_BYTES:
+        raise EntryError(
+            f"asset is {len(blob)} bytes, over the {MAX_BYTES} limit"
         )
-    if not is_complete_jpeg(asset):
-        return abort(ASSET + " is not a complete JPEG file: " + asset)
-
-    dimensions = read_jpeg_size(asset)
-    if dimensions is None:
-        return abort("could not read the JPEG dimensions of " + ASSET)
-    width, height = dimensions
-    if width > PIXEL_LIMIT or height > PIXEL_LIMIT:
-        return abort(
-            "%s is %dx%d, over the %dx%d limit"
-            % (ASSET, width, height, PIXEL_LIMIT, PIXEL_LIMIT)
+    if blob[:3] != b"\xff\xd8\xff":
+        raise EntryError("asset does not open with the JPEG start marker")
+    if blob[-2:] != b"\xff\xd9":
+        raise EntryError("asset does not end with the JPEG end marker")
+    width, height = jpeg_dimensions(blob)
+    if width <= 0 or height <= 0:
+        raise EntryError("asset reports zero width or height")
+    if width > MAX_SIDE or height > MAX_SIDE:
+        raise EntryError(
+            f"asset is {width}x{height}, over the {MAX_SIDE}x{MAX_SIDE} limit"
         )
-    print("%s is %dx%d and %d bytes, within the limits" % (ASSET, width, height, size))
+    return width, height
 
-    target_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or FALLBACK_OUTPUT_DIR
-    os.makedirs(target_dir, exist_ok=True)
-    target = os.path.join(target_dir, OUTPUT_NAME)
 
-    shutil.copyfile(asset, target)
+def publish() -> int:
+    """Validate asset.jpg and write it out as entry.png, verified."""
+    here = Path(__file__).resolve().parent
+    source = here / ASSET_NAME
+    if not source.is_file():
+        print(f"error: no {ASSET_NAME} beside main.py", file=sys.stderr)
+        return 1
+    blob = source.read_bytes()
+    try:
+        width, height = check_picture(blob)
+    except EntryError as problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 1
+    print(
+        f"{ASSET_NAME} is {width}x{height} and {len(blob)} bytes, "
+        "within the limits"
+    )
 
-    if os.path.getsize(target) != size:
-        return abort(
-            "size mismatch after copy: %s is %d bytes, expected %d"
-            % (target, os.path.getsize(target), size)
-        )
-    source_digest = digest_file(asset)
-    if digest_file(target) != source_digest:
-        return abort("SHA-256 mismatch after copy: " + target)
+    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / OUT_NAME
+    target.write_bytes(blob)
 
-    target_dimensions = read_jpeg_size(target)
-    if target_dimensions != (width, height):
-        return abort(
-            "output dimensions %s differ from the source %dx%d"
-            % (target_dimensions, width, height)
-        )
+    written = target.read_bytes()
+    if len(written) != len(blob):
+        print("error: output size differs from the source", file=sys.stderr)
+        return 1
+    if digest(written) != digest(blob):
+        print("error: output SHA-256 differs from the source", file=sys.stderr)
+        return 1
+    if jpeg_dimensions(written) != (width, height):
+        print("error: output dimensions differ from the source", file=sys.stderr)
+        return 1
 
-    print("wrote %s (%d bytes, sha256 %s)" % (target, size, source_digest))
+    print(f"wrote {target} ({len(blob)} bytes, sha256 {digest(blob)})")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(publish())
